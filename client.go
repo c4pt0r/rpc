@@ -2,12 +2,11 @@ package rpc
 
 import (
 	"bufio"
+	"errors"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/ngaut/log"
 )
 
 type Client struct {
@@ -17,8 +16,7 @@ type Client struct {
 	callID       int64
 	conn         net.Conn
 	wc           chan *clientCall
-	wr           *bufio.Writer
-	rdr          *bufio.Reader
+	workers      sync.WaitGroup
 }
 
 type clientCall struct {
@@ -29,38 +27,48 @@ type clientCall struct {
 func NewClient(addr string) *Client {
 	return &Client{
 		addr:         addr,
-		wc:           make(chan *clientCall, 100),
+		wc:           make(chan *clientCall, 20),
 		ongoingCalls: make(map[int64]*clientCall),
 	}
 }
 
 func (cli *Client) Connect() error {
+	cli.mu.Lock()
+	defer cli.mu.Unlock()
 	conn, err := net.Dial("tcp", cli.addr)
 	if err != nil {
 		return err
 	}
 	cli.conn = conn
-	cli.wr = bufio.NewWriter(conn)
-	cli.rdr = bufio.NewReader(conn)
 	go cli.writeLoop()
 	go cli.readLoop()
 	return nil
 }
 
-func (cli *Client) Close() {
+func (cli *Client) Reset() {
+	cli.mu.Lock()
+	defer cli.mu.Unlock()
 	if cli.conn != nil {
 		cli.conn.Close()
 		cli.conn = nil
 	}
+	cli.callID = 0
+	cli.ongoingCalls = make(map[int64]*clientCall)
 }
 
 func (cli *Client) readLoop() {
-	defer cli.Close()
+	defer cli.Reset()
+	cli.mu.Lock()
+	if cli.conn == nil {
+		cli.mu.Unlock()
+		return
+	}
+	rdr := bufio.NewReader(cli.conn)
+	cli.mu.Unlock()
 	for {
-		resp, err := unmarshalResp(cli.rdr)
+		resp, err := unmarshalResp(rdr)
 		if err != nil {
-			log.Error(err)
-			return
+			break
 		}
 		cli.mu.Lock()
 		call, ok := cli.ongoingCalls[resp.reqID]
@@ -74,18 +82,26 @@ func (cli *Client) readLoop() {
 }
 
 func (cli *Client) writeLoop() {
-	defer cli.Close()
+	defer cli.Reset()
+	cli.mu.Lock()
+	if cli.conn == nil {
+		cli.mu.Unlock()
+		return
+	}
+	wr := bufio.NewWriter(cli.conn)
+	cli.mu.Unlock()
 	for {
 		select {
 		case call := <-cli.wc:
-			_, err := cli.wr.Write(call.marshal())
+			cli.mu.Lock()
+			cli.ongoingCalls[call.reqID] = call
+			cli.mu.Unlock()
+			_, err := wr.Write(call.marshal())
 			if err != nil {
-				log.Error(err)
-				return
+				break
 			}
 			if len(cli.wc) == 0 {
-				if err := cli.wr.Flush(); err != nil {
-					log.Error(err)
+				if err := wr.Flush(); err != nil {
 					return
 				}
 			}
@@ -97,7 +113,7 @@ func (cli *Client) Call(signature string, param []byte) ([]byte, error) {
 	id := atomic.AddInt64(&cli.callID, 1)
 	parts := strings.Split(signature, ".")
 	respCh := make(chan *resp)
-	c := &clientCall{
+	call := &clientCall{
 		call: call{
 			reqID:       id,
 			serviceName: parts[0],
@@ -107,9 +123,12 @@ func (cli *Client) Call(signature string, param []byte) ([]byte, error) {
 		rc: respCh,
 	}
 	cli.mu.Lock()
-	cli.ongoingCalls[id] = c
+	if cli.conn == nil {
+		cli.mu.Unlock()
+		return nil, errors.New("connection is not established")
+	}
 	cli.mu.Unlock()
-	cli.wc <- c
-	resp := <-c.rc
+	cli.wc <- call
+	resp := <-call.rc
 	return resp.result, resp.err
 }
